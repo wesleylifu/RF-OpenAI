@@ -1,1 +1,1 @@
-# MMAI-845-Team-College-
+# MMAI-845-Team-College
