@@ -1,47 +1,51 @@
 import copy
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Beta,Normal
-import math
-
+from torch.distributions import Beta, Normal
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 class Actor(nn.Module):
-	def __init__(self, state_dim, action_dim, net_width, maxaction):
+	def __init__(self, state_space, action_space, net_width, max_action):
 		super(Actor, self).__init__()
 
-		self.l1 = nn.Linear(state_dim, net_width)
+		# Define NN input layer by using the state space
+		self.l1 = nn.Linear(state_space, net_width)
+		# Define NN middle layer by # of neutron - which is 128 by default
 		self.l2 = nn.Linear(net_width, net_width)
-		self.l3 = nn.Linear(net_width, action_dim)
+		# Define NN output layer according to the action space
+		self.l3 = nn.Linear(net_width, action_space)
 
-		self.maxaction = maxaction
+		self.max_action = max_action
 
+	# Forward propagation
 	def forward(self, state):
 		a = torch.tanh(self.l1(state))
 		a = torch.tanh(self.l2(a))
-		a = torch.tanh(self.l3(a)) * self.maxaction
+		a = torch.tanh(self.l3(a)) * self.max_action
 		return a
 
-
+# A pair of Critic is defined as we are using TD3
 class Q_Critic(nn.Module):
-	def __init__(self, state_dim, action_dim, net_width):
+	def __init__(self, state_space, action_space, net_width):
 		super(Q_Critic, self).__init__()
 
 		# Q1 architecture
-		self.l1 = nn.Linear(state_dim + action_dim, net_width)
+		self.l1 = nn.Linear(state_space + action_space, net_width)
 		self.l2 = nn.Linear(net_width, net_width)
+		# Only 1 deterministric action should be defined as output
 		self.l3 = nn.Linear(net_width, 1)
 
 		# Q2 architecture
-		self.l4 = nn.Linear(state_dim + action_dim, net_width)
+		self.l4 = nn.Linear(state_space + action_space, net_width)
 		self.l5 = nn.Linear(net_width, net_width)
+		# Only 1 deterministric action should be defined as output
 		self.l6 = nn.Linear(net_width, 1)
 
-
+	# Forward propagation
 	def forward(self, state, action):
 		sa = torch.cat([state, action], 1)
 
@@ -56,6 +60,7 @@ class Q_Critic(nn.Module):
 
 
 	def Q1(self, state, action):
+		# Concatenates the given sequence of seq tensors in the given dimension
 		sa = torch.cat([state, action], 1)
 
 		q1 = F.relu(self.l1(sa))
@@ -68,46 +73,62 @@ class Q_Critic(nn.Module):
 class TD3(object):
 	def __init__(
 		self,
-		env_with_Dead,
-		state_dim,
-		action_dim,
+		has_terminal_state,
+		state_space,
+		action_space,
 		max_action,
+		# Discount factor. (Always between 0 and 1.)
 		gamma=0.99,
 		net_width=128,
+		# Learning rate for policy - actor network
 		a_lr=1e-4,
+		# Learning rate for Q-networks - Critic network
 		c_lr=1e-4,
-		Q_batchsize = 256
+		q_batchsize = 256
 	):
 
-		self.actor = Actor(state_dim, action_dim, net_width, max_action).to(device)
+		# Remark: highly recommend to train your own with GPU resources
+		self.actor = Actor(state_space, action_space, net_width, max_action).to(device)
 		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=a_lr)
 		self.actor_target = copy.deepcopy(self.actor)
 
-		self.q_critic = Q_Critic(state_dim, action_dim, net_width).to(device)
+		# Remark: highly recommend to train your own with GPU resources
+		self.q_critic = Q_Critic(state_space, action_space, net_width).to(device)
 		self.q_critic_optimizer = torch.optim.Adam(self.q_critic.parameters(), lr=c_lr)
 		self.q_critic_target = copy.deepcopy(self.q_critic)
 
-		self.env_with_Dead = env_with_Dead
-		self.action_dim = action_dim
+		self.has_terminal_state = has_terminal_state
+		self.action_space = action_space
 		self.max_action = max_action
+		# Discount for future rewards
 		self.gamma = gamma
-		self.policy_noise = 0.2*max_action
-		self.noise_clip = 0.5*max_action
+		self.policy_noise = 0.2 * max_action
+		# Limit for absolute value of target policy smoothing noise
+		self.noise_clip = 0.5 * max_action
+		# Target policy update parameter (1-tau)
 		self.tau = 0.005
-		self.Q_batchsize = Q_batchsize
+		# Num of transitions sampled from replay buffer
+		self.q_batchsize = q_batchsize
+		# Delayed policy updates parameter
 		self.delay_counter = -1
 		self.delay_freq = 1
 
-	def select_action(self, state):#only used when interact with the env
+	#Remark: select_action is only used when interact with the environment (Non-training)
+	def select_action(self, state):
 		with torch.no_grad():
 			state = torch.FloatTensor(state.reshape(1, -1)).to(device)
 			a = self.actor(state)
 		return a.cpu().numpy().flatten()
 
 	def train(self,replay_buffer):
+		# abbreviations used in the below training part
+        # a = action
+     	# s = current state
+    	# r = reward
+    	# s_prime = target state
 		self.delay_counter += 1
 		with torch.no_grad():
-			s, a, r, s_prime, dead_mask = replay_buffer.sample(self.Q_batchsize)
+			s, a, r, s_prime, dead_mask = replay_buffer.sample(self.q_batchsize)
 			noise = (torch.randn_like(a) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
 			smoothed_target_a = (
 					self.actor_target(s_prime) + noise  # Noisy on target action
@@ -115,12 +136,15 @@ class TD3(object):
 
 		# Compute the target Q value
 		target_Q1, target_Q2 = self.q_critic_target(s_prime, smoothed_target_a)
+		# Take the smallest number between Q1 and Q2
 		target_Q = torch.min(target_Q1, target_Q2)
-		'''DEAD OR NOT'''
-		if self.env_with_Dead:
-			target_Q = r + (1 - dead_mask) * self.gamma * target_Q  # env with dead
+		# Decide whether it reaches terminal state
+		if self.has_terminal_state:
+			# when terminal state is reached
+			target_Q = r + (1 - dead_mask) * self.gamma * target_Q  
 		else:
-			target_Q = r + self.gamma * target_Q  # env without dead
+			# when terminal state is not reached
+			target_Q = r + self.gamma * target_Q  
 
 
 		# Get current Q estimates
@@ -150,16 +174,14 @@ class TD3(object):
 
 			self.delay_counter = -1
 
-
+	# Save the Actor and Critic models
 	def save(self,episode):
 		torch.save(self.actor.state_dict(), "ppo_actor{}.pth".format(episode))
 		torch.save(self.q_critic.state_dict(), "ppo_q_critic{}.pth".format(episode))
 
-
+	# Save the Actor and Critic models
 	def load(self,episode):
-
 		self.actor.load_state_dict(torch.load("ppo_actor{}.pth".format(episode)))
 		self.q_critic.load_state_dict(torch.load("ppo_q_critic{}.pth".format(episode)))
-
 
 
