@@ -1,1 +1,1 @@
-# MMAI-845-Team-College
+# Bi-pedal Rescuer Robot
